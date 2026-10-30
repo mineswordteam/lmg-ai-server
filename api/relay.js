@@ -2,7 +2,9 @@
 // Environment variables: GEMINI_API_KEY, RELAY_TOKENS (comma-separated).
 // Daily limits (stored in Upstash Redis): UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN (or KV_REST_API_URL + KV_REST_API_TOKEN).
 // Optional: DAILY_MESSAGES (default 80 per device), DAILY_CALLS (default 400), DAILY_IP_MESSAGES (default 600 per network).
-const OK_PATH = /^\/v1beta\/models\/(gemma|gemini)-[\w.-]+:(generateContent|streamGenerateContent)$/;
+// Only the model(s) you choose can be used (default: gemma-4-26b-a4b-it). Change with the ALLOWED_MODELS environment variable (comma-separated).
+const ALLOWED = (process.env.ALLOWED_MODELS || 'gemma-4-26b-a4b-it').split(',').map(x => x.trim()).filter(Boolean);
+function modelOk(path) { const m = /^\/v1beta\/models\/([\w.-]+):generateContent$/.exec(path); return !!m && ALLOWED.includes(m[1]); }
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
 const mem = new Map();   // fallback when Redis is not configured (per server instance, best effort only)
@@ -29,7 +31,7 @@ module.exports = async (req, res) => {
   if (!got) return res.status(403).send('forbidden: the request had no x-relay-token header');
   if (!tokens.includes(got)) return res.status(403).send(`forbidden: wrong token (received ${got.length} characters, server expects ${tokens.map(t => t.length).join(' or ')})`);
   const path = '/v1beta/' + [].concat(req.query.path || []).join('/').replace(/^\/+/, '');
-  if (req.method !== 'POST' || !OK_PATH.test(path)) return res.status(404).send('not found: ' + path);
+  if (req.method !== 'POST' || !modelOk(path)) return res.status(404).send('not found or model not allowed: ' + path);
   const key = process.env.GEMINI_API_KEY || req.headers['x-goog-api-key'] || '';
   if (!key) return res.status(500).send('server error: GEMINI_API_KEY is not set');
   const dev = String(req.headers['x-device-id'] || '').slice(0, 64);
@@ -39,9 +41,11 @@ module.exports = async (req, res) => {
   const ip = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || 'unknown';
   const day = new Date().toISOString().slice(0, 10), isNew = req.headers['x-lmg-new'] === '1';
   const MAXM = Number(process.env.DAILY_MESSAGES) || 80, MAXC = Number(process.env.DAILY_CALLS) || 400, MAXIP = Number(process.env.DAILY_IP_MESSAGES) || 600;
-  let counts;
-  try { counts = await bump([`c:${dev}:${day}`, ...(isNew ? [`m:${dev}:${day}`, `i:${ip}:${day}`] : [])]); }
-  catch (e) { return res.status(503).send('server error: usage counter unavailable'); }
+  let counts = null;   // if the counter store has a hiccup, retry once and then let the request through (never block users because of it)
+  for (let i = 0; i < 2 && !counts; i++) {
+    try { counts = await bump([`c:${dev}:${day}`, ...(isNew ? [`m:${dev}:${day}`, `i:${ip}:${day}`] : [])]); } catch (e) { /* retry */ }
+  }
+  if (!counts) counts = [0, 0, 0];
   const [calls, msgs = 0, ipMsgs = 0] = counts;
   if (calls > MAXC) return res.status(429).send(`daily limit: too many requests today (${MAXC}). Try again tomorrow.`);
   if (isNew && msgs > MAXM) return res.status(429).send(`daily limit: ${MAXM} messages per day reached. Try again tomorrow.`);
